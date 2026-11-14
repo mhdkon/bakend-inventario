@@ -44,24 +44,21 @@ app.use(cookieParser());
 // ---------- VALIDACIÓN DE VARIABLES DE ENTORNO ----------
 const envSchema = z.object({
   PORT: z.string().default('3000'),
-  PGUSER: z.string().min(1, 'PGUSER es obligatorio'),
-  PGHOST: z.string().min(1, 'PGHOST es obligatorio'),
-  PGDATABASE: z.string().min(1, 'PGDATABASE es obligatorio'),
-  PGPASSWORD: z.string().min(1, 'PGPASSWORD es obligatorio'),
+  DATABASE_URL: z.string().url().optional(),
+  PGUSER: z.string().optional(),
+  PGHOST: z.string().optional(),
+  PGDATABASE: z.string().optional(),
+  PGPASSWORD: z.string().optional(),
   PGPORT: z.string().default('5432'),
   JWT_SECRET: z.string().min(32, 'JWT_SECRET debe tener al menos 32 caracteres'),
   JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET debe tener al menos 32 caracteres'),
   CORS_ORIGINS: z.string().min(1, 'CORS_ORIGINS es obligatorio'),
   FRONTEND_URL: z.string().url('FRONTEND_URL debe ser una URL válida'),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-});
-
-const envParsed = envSchema.safeParse(process.env);
-if (!envParsed.success) {
-  console.error('❌ Variables de entorno inválidas o faltantes:');
-  console.error(JSON.stringify(envParsed.error.flatten().fieldErrors, null, 2));
-  process.exit(1);
-}
+}).refine(
+  (data) => data.DATABASE_URL || (data.PGUSER && data.PGHOST && data.PGDATABASE && data.PGPASSWORD),
+  { message: 'Debes configurar DATABASE_URL o las variables PGUSER/PGHOST/PGDATABASE/PGPASSWORD' }
+);
 
 // ---------- RATE LIMITING ----------
 const loginLimiter = rateLimit({
