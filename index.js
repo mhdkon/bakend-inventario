@@ -11,6 +11,11 @@ import dotenv from 'dotenv';
 import { z } from 'zod';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
+import sgMail from '@sendgrid/mail';
+import multer from 'multer';
+import { parse } from 'csv-parse';
+import fs from 'fs';
+import Stripe from 'stripe';
 
 dotenv.config();
 const { Pool } = pg;
@@ -28,9 +33,37 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json({ limit: '1mb' }));
+
+// Middleware de JSON que respeta el webhook de Stripe (raw body)
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/webhooks/stripe') return next();
+  express.json({ limit: '1mb' })(req, res, next);
+});
 app.use(cookieParser());
 
+// ---------- VALIDACIÓN DE VARIABLES DE ENTORNO ----------
+const envSchema = z.object({
+  PORT: z.string().default('3000'),
+  PGUSER: z.string().min(1, 'PGUSER es obligatorio'),
+  PGHOST: z.string().min(1, 'PGHOST es obligatorio'),
+  PGDATABASE: z.string().min(1, 'PGDATABASE es obligatorio'),
+  PGPASSWORD: z.string().min(1, 'PGPASSWORD es obligatorio'),
+  PGPORT: z.string().default('5432'),
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET debe tener al menos 32 caracteres'),
+  JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET debe tener al menos 32 caracteres'),
+  CORS_ORIGINS: z.string().min(1, 'CORS_ORIGINS es obligatorio'),
+  FRONTEND_URL: z.string().url('FRONTEND_URL debe ser una URL válida'),
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+});
+
+const envParsed = envSchema.safeParse(process.env);
+if (!envParsed.success) {
+  console.error('❌ Variables de entorno inválidas o faltantes:');
+  console.error(JSON.stringify(envParsed.error.flatten().fieldErrors, null, 2));
+  process.exit(1);
+}
+
+// ---------- RATE LIMITING ----------
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -39,18 +72,40 @@ const loginLimiter = rateLimit({
   message: { error: 'Demasiados intentos. Prueba de nuevo en 15 minutos.' },
 });
 
-const pool = new Pool({
-  user: process.env.PGUSER || 'postgres',
-  host: process.env.PGHOST || 'localhost',
-  database: process.env.PGDATABASE || 'restaurant_inventory',
-  password: process.env.PGPASSWORD || 'postgres',
-  port: process.env.PGPORT || 5432,
-  max: 20,
-  idleTimeoutMillis: 30000,
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiadas peticiones. Espera unos minutos.' },
+  skip: (req) => req.path === '/health',
 });
+app.use(globalLimiter);
 
-const ACCESS_SECRET = process.env.JWT_SECRET || 'cambia_esto';
-const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || (ACCESS_SECRET + '_refresh');
+// ---------- POSTGRESQL ----------
+const pool = new Pool(
+  process.env.DATABASE_URL
+    ? {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false },
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+      }
+    : {
+        user: process.env.PGUSER,
+        host: process.env.PGHOST,
+        database: process.env.PGDATABASE,
+        password: process.env.PGPASSWORD,
+        port: process.env.PGPORT,
+        max: 20,
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 5000,
+      }
+);
+// ---------- JWT ----------
+const ACCESS_SECRET = process.env.JWT_SECRET;
+const REFRESH_SECRET = process.env.JWT_REFRESH_SECRET;
 const ACCESS_TTL = '15m';
 const REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const COOKIE_NAME = 'refresh_token';
@@ -78,30 +133,52 @@ function signRefresh(user) {
 
 // ---------- EMAIL ----------
 let mailer = null;
-if (process.env.EMAIL_ENABLED === 'true') {
+let mailerType = 'none';
+
+if (process.env.EMAIL_ENABLED === 'true' && process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  mailerType = 'sendgrid';
+  log('info', 'SendGrid configurado');
+} else if (process.env.EMAIL_ENABLED === 'true' && process.env.SMTP_HOST) {
   mailer = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: false,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
   });
+  mailerType = 'smtp';
   log('info', 'SMTP configurado');
 } else {
   log('warn', 'EMAIL_ENABLED=false — los emails se imprimirán en consola');
 }
+
 async function sendMail({ to, subject, html, text }) {
-  if (!mailer) {
+  if (mailerType === 'sendgrid') {
+    try {
+      await sgMail.send({
+        to,
+        from: { email: process.env.SENDGRID_FROM_EMAIL, name: process.env.SENDGRID_FROM_NAME },
+        subject,
+        html: html || text,
+        text: text || undefined,
+      });
+      log('info', 'EMAIL enviado (SendGrid)', { to, subject });
+    } catch (e) {
+      log('error', 'EMAIL fallo (SendGrid)', { error: e.message });
+    }
+  } else if (mailerType === 'smtp') {
+    try {
+      await mailer.sendMail({ from: process.env.EMAIL_FROM, to, subject, html, text });
+      log('info', 'EMAIL enviado (SMTP)', { to, subject });
+    } catch (e) {
+      log('error', 'EMAIL fallo (SMTP)', { error: e.message });
+    }
+  } else {
     log('info', 'EMAIL (modo consola)', { to, subject, text });
-    return;
-  }
-  try {
-    await mailer.sendMail({ from: process.env.EMAIL_FROM, to, subject, html, text });
-    log('info', 'EMAIL enviado', { to, subject });
-  } catch (e) {
-    log('error', 'EMAIL fallo', { error: e.message });
   }
 }
 
+// ---------- MIDDLEWARES ----------
 async function auth(req, res, next) {
   const h = req.headers.authorization;
   if (!h) return res.status(401).json({ error: 'Token requerido' });
@@ -294,6 +371,63 @@ app.post('/api/auth/register', async (req, res) => {
   } finally { client.release(); }
 });
 
+// ---------- RECUPERACIÓN DE CONTRASEÑA ----------
+app.post('/api/auth/forgot-password', loginLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email requerido' });
+  try {
+    const { rows } = await pool.query('SELECT id, email, full_name FROM users WHERE email=$1 AND active=true', [email]);
+    if (rows[0]) {
+      const token = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+      await pool.query(
+        'INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES ($1,$2,$3)',
+        [rows[0].id, tokenHash, expiresAt]);
+      const link = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
+      await sendMail({
+        to: rows[0].email,
+        subject: 'Recupera tu contraseña de StockFlow',
+        text: `Hola ${rows[0].full_name},\n\nPara restablecer tu contraseña, abre este enlace (válido 1 hora):\n${link}\n\nSi no fuiste tú, ignora este mensaje.`,
+        html: `<p>Hola ${rows[0].full_name},</p><p>Para restablecer tu contraseña, haz clic aquí (válido 1 hora):</p><p><a href="${link}">${link}</a></p><p>Si no fuiste tú, ignora este mensaje.</p>`,
+      });
+    }
+    res.json({ ok: true, message: 'Si el email existe, recibirás un enlace de recuperación.' });
+  } catch (e) {
+    log('error', 'forgot-password fallo', { error: e.message });
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password || password.length < 8)
+    return res.status(400).json({ error: 'Token y contraseña (mín. 8) son obligatorios' });
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const { rows } = await pool.query(
+      `SELECT id, user_id FROM password_reset_tokens
+       WHERE token_hash=$1 AND used=false AND expires_at > NOW()`, [tokenHash]);
+    if (!rows[0]) return res.status(400).json({ error: 'Token inválido o expirado' });
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, rows[0].user_id]);
+    await pool.query('UPDATE password_reset_tokens SET used=true WHERE id=$1', [rows[0].id]);
+    res.json({ ok: true });
+  } catch (e) {
+    log('error', 'reset-password fallo', { error: e.message });
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
+app.post('/api/auth/welcome-seen', auth, async (req, res) => {
+  try {
+    await pool.query('UPDATE users SET welcome_seen = true WHERE id = $1', [req.user.id]);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Error interno' });
+  }
+});
+
 // ---------- INVITACIONES (superadmin) ----------
 app.post('/api/admin/invites', auth, requireRole('superadmin'), async (req, res) => {
   const { role = 'admin', restaurant_id = null, expires_hours = 72 } = req.body;
@@ -439,6 +573,16 @@ app.post('/api/users/:id/reset-password', auth, requireSubscription, requireRole
     res.json({ ok: true });
   } catch (e) { res.status(400).json({ error: e.message }); }
   finally { client.release(); }
+});
+
+// ---------- MI EMPRESA ----------
+app.get('/api/my-restaurant', auth, async (req, res) => {
+  if (!req.user.restaurantId) return res.status(404).json({ error: 'Sin empresa asignada' });
+  const { rows } = await pool.query(
+    'SELECT id, name, plan, industry, subscription_status, active FROM restaurants WHERE id=$1',
+    [req.user.restaurantId]);
+  if (!rows[0]) return res.status(404).json({ error: 'Empresa no encontrada' });
+  res.json(rows[0]);
 });
 
 // ---------- RESTAURANTES ----------
@@ -635,6 +779,123 @@ app.post('/api/movements', auth, requireSubscription, requireRole('admin','manag
     res.status(201).json({ ok: true });
   } catch (e) { await client.query('ROLLBACK'); res.status(400).json({ error: e.message }); }
   finally { client.release(); }
+});
+
+// ---------- IMPORTACIÓN CSV ----------
+const upload = multer({ dest: 'uploads/', limits: { fileSize: 5 * 1024 * 1024 } });
+
+app.post('/api/products/import', auth, requireSubscription, requireRole('admin','manager','warehouse'), upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Archivo CSV requerido' });
+  const rid = req.user.restaurantId;
+  const results = [];
+  const errors = [];
+  try {
+    const parser = fs.createReadStream(req.file.path).pipe(parse({
+      columns: true,
+      skip_empty_lines: true,
+      bom: true,
+      trim: true,
+    }));
+    for await (const row of parser) {
+      const name = (row.name || row.nombre || '').trim();
+      if (!name) { errors.push({ row, error: 'Nombre vacío' }); continue; }
+      const price = parseFloat(row.purchase_price || row.precio || 0) || 0;
+      const stockMin = parseFloat(row.stock_min || row.stock_minimo || 0) || 0;
+      try {
+        await pool.query(
+          `INSERT INTO products (restaurant_id, name, sku, barcode, unit, purchase_price, stock_min, location)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [rid, name, row.sku || null, row.barcode || null, row.unit || 'ud', price, stockMin, row.location || null]);
+        results.push({ name, ok: true });
+      } catch (e) {
+        errors.push({ name, error: e.message });
+      }
+    }
+    fs.unlinkSync(req.file.path);
+    res.json({ imported: results.length, errors: errors.length, details: errors.slice(0, 20) });
+  } catch (e) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    res.status(400).json({ error: 'CSV inválido: ' + e.message });
+  }
+});
+
+// ---------- STRIPE ----------
+let stripe = null;
+if (process.env.STRIPE_ENABLED === 'true' && process.env.STRIPE_SECRET_KEY) {
+  stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  log('info', 'Stripe configurado');
+} else {
+  log('warn', 'STRIPE_ENABLED=false — cobros simulados');
+}
+
+const PLAN_PRICE = {
+  basic: process.env.STRIPE_PRICE_BASIC || null,
+  pro: process.env.STRIPE_PRICE_PRO || null,
+  enterprise: process.env.STRIPE_PRICE_ENTERPRISE || null,
+};
+
+app.post('/api/billing/checkout', auth, requireRole('admin','superadmin'), async (req, res) => {
+  const { plan } = req.body;
+  if (!['basic','pro','enterprise'].includes(plan))
+    return res.status(400).json({ error: 'Plan inválido' });
+  const rid = req.user.restaurantId;
+  if (!stripe) {
+    await pool.query('UPDATE restaurants SET plan=$1, subscription_status=$2 WHERE id=$3', [plan, 'active', rid]);
+    return res.json({ simulated: true, message: `Plan ${plan} activado (modo simulado)` });
+  }
+  try {
+    const { rows } = await pool.query('SELECT * FROM restaurants WHERE id=$1', [rid]);
+    const restaurant = rows[0];
+    let customerId = restaurant.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ name: restaurant.name });
+      customerId = customer.id;
+      await pool.query('UPDATE restaurants SET stripe_customer_id=$1 WHERE id=$2', [customerId, rid]);
+    }
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer: customerId,
+      line_items: [{ price: PLAN_PRICE[plan], quantity: 1 }],
+      success_url: `${process.env.FRONTEND_URL}/?billing=success`,
+      cancel_url: `${process.env.FRONTEND_URL}/?billing=cancel`,
+      metadata: { restaurant_id: String(rid), plan },
+    });
+    res.json({ url: session.url });
+  } catch (e) {
+    log('error', 'checkout fallo', { error: e.message });
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) return res.json({ received: true, simulated: true });
+  const sig = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    log('error', 'webhook stripe firma inválida', { error: e.message });
+    return res.status(400).send(`Webhook Error: ${e.message}`);
+  }
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const s = event.data.object;
+      const rid = Number(s.metadata.restaurant_id);
+      const plan = s.metadata.plan;
+      await pool.query('UPDATE restaurants SET plan=$1, subscription_status=$2 WHERE id=$3', [plan, 'active', rid]);
+      log('info', 'stripe checkout ok', { rid, plan });
+    } else if (event.type === 'invoice.payment_failed') {
+      const inv = event.data.object;
+      await pool.query("UPDATE restaurants SET subscription_status='past_due' WHERE stripe_customer_id=$1", [inv.customer]);
+    } else if (event.type === 'customer.subscription.deleted') {
+      const sub = event.data.object;
+      await pool.query("UPDATE restaurants SET subscription_status='cancelled' WHERE stripe_customer_id=$1", [sub.customer]);
+    }
+    res.json({ received: true });
+  } catch (e) {
+    log('error', 'webhook procesado fallo', { error: e.message });
+    res.status(500).json({ error: 'Webhook handler failed' });
+  }
 });
 
 // ---------- PROVEEDORES ----------
@@ -924,9 +1185,31 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Error interno del servidor' });
 });
 
+// ---------- ARRANQUE ----------
 const PORT = process.env.PORT || 3000;
-pool.query('SELECT 1').then(async () => {
-  log('info', 'PostgreSQL conectado');
-  await ensureAdmin();
-  app.listen(PORT, '0.0.0.0', () => log('info', `API en http://localhost:${PORT}`));
-}).catch(err => log('error', 'Error PostgreSQL', { error: err.message }));
+
+async function start() {
+  try {
+    log('info', 'Probando conexión a PostgreSQL...', {
+      host: process.env.PGHOST,
+      port: process.env.PGPORT,
+      user: process.env.PGUSER,
+      database: process.env.PGDATABASE,
+    });
+    await pool.query('SELECT 1');
+    log('info', 'PostgreSQL conectado');
+    await ensureAdmin();
+    app.listen(PORT, '0.0.0.0', () => log('info', `API en http://localhost:${PORT}`));
+  } catch (err) {
+    log('error', 'Error PostgreSQL', {
+      message: err.message,
+      code: err.code,
+      host: process.env.PGHOST,
+      port: process.env.PGPORT,
+      user: process.env.PGUSER,
+      database: process.env.PGDATABASE,
+    });
+    process.exit(1);
+  }
+}
+start();
