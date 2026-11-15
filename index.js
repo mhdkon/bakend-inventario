@@ -20,6 +20,7 @@ import Stripe from 'stripe';
 dotenv.config();
 const { Pool } = pg;
 const app = express();
+app.set('trust proxy', 1);
 
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentSecurityPolicy: false }));
